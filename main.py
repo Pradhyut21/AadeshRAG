@@ -6,8 +6,9 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Dict, Any, List, Optional
 
-from fastapi import FastAPI, HTTPException, status, Query, UploadFile, File
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, status, Query, UploadFile, File, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, RedirectResponse, JSONResponse
 from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
@@ -33,6 +34,7 @@ def initialize_default_dataset():
     if not vector_store.load_user_index("rajasthani"):
         pdf_files = []
         if os.path.exists(settings.DATA_DIR):
+            pdf_files.extend(glob.glob(os.path.join(settings.DATA_DIR, "**", "*.pdf"), recursive=True))
             pdf_files.extend(glob.glob(os.path.join(settings.DATA_DIR, "*.pdf")))
         pdf_files.extend(glob.glob("*.pdf"))
         pdf_files = sorted(list(set(pdf_files)))
@@ -63,9 +65,18 @@ app = FastAPI(
     redoc_url="/redoc"
 )
 
+# Enable CORS for cross-origin browser requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Pydantic Schemas matching reference spec http://35.200.212.88:8080/docs
 class QueryRequest(BaseModel):
-    user_id: str = Field(default="rajasthani", description="Dataset identifier (e.g. rajasthani, dev1, med, or any custom user ID)")
+    user_id: str = Field(default="rajasthani", description="Dataset identifier (e.g. rajasthani, dev1, med, or custom user ID)")
     query: str = Field(..., description="Natural language query")
     include_timings: bool = Field(default=True, description="Include execution timing metrics")
 
@@ -74,6 +85,11 @@ class QueryResponse(BaseModel):
     answer: str
     context: str
     timings: Optional[Dict[str, float]] = Field(default=None, description="Execution timing metrics in ms")
+
+@app.get("/", status_code=status.HTTP_200_OK)
+async def root():
+    """Root route redirecting to interactive Swagger docs."""
+    return RedirectResponse(url="/docs")
 
 @app.get("/health", status_code=status.HTTP_200_OK)
 async def health():
@@ -84,6 +100,20 @@ async def health():
         "loaded_datasets": loaded_users,
         "embedding_model": settings.EMBEDDING_MODEL,
         "llm_model": settings.GROQ_MODEL
+    }
+
+@app.get("/query", status_code=status.HTTP_200_OK)
+@app.get("/rag/query", status_code=status.HTTP_200_OK)
+@app.get("/rag/query/stream", status_code=status.HTTP_200_OK)
+@app.get("/rag/upload/batch", status_code=status.HTTP_200_OK)
+async def endpoint_get_fallback(request: Request):
+    """GET fallback to prevent 405 errors when URLs are opened directly in a browser."""
+    path = request.url.path
+    return {
+        "endpoint": path,
+        "message": f"Endpoint '{path}' expects an HTTP POST request.",
+        "docs": "/docs",
+        "example_curl": f"curl -X POST \"http://127.0.0.1:8080{path}\" -H \"Content-Type: application/json\" -d '{{\"user_id\": \"rajasthani\", \"query\": \"सड़क दुर्घटना में प्रोत्साहन राशि कितनी है?\"}}'"
     }
 
 @app.post("/rag/upload/batch", status_code=status.HTTP_200_OK)
@@ -129,7 +159,6 @@ async def read_dataset(
 ):
     """Read dataset details safely even if uninitialized."""
     clean_uid = user_id.strip()
-    # Try loading from disk if not in memory
     if not vector_store.is_user_loaded(clean_uid):
         vector_store.load_user_index(clean_uid)
 
@@ -158,7 +187,6 @@ async def _process_query(request: QueryRequest) -> QueryResponse:
 
     uid = request.user_id.strip() if request.user_id else "rajasthani"
     
-    # Try loading user index if not loaded
     if not vector_store.is_user_loaded(uid):
         vector_store.load_user_index(uid)
 
@@ -231,7 +259,6 @@ async def query_rag_stream(request: QueryRequest):
     context_text = "\n\n".join([c["text"] for c in retrieved_chunks]) if retrieved_chunks else ""
 
     async def sse_generator():
-        # First event: yield metadata context
         meta_payload = {
             "type": "metadata",
             "query": clean_query,
@@ -239,7 +266,6 @@ async def query_rag_stream(request: QueryRequest):
         }
         yield f"data: {json.dumps(meta_payload, ensure_ascii=False)}\n\n"
 
-        # Stream token chunks
         async for token in llm_client.generate_answer_stream(clean_query, context_text):
             token_payload = {"type": "token", "content": token}
             yield f"data: {json.dumps(token_payload, ensure_ascii=False)}\n\n"

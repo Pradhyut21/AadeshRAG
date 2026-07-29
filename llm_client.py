@@ -1,6 +1,7 @@
+import os
 import logging
-from typing import List, Dict, Any, AsyncGenerator
-from groq import AsyncGroq, GroqError
+from typing import AsyncGenerator
+from groq import AsyncGroq
 from config import settings
 
 logger = logging.getLogger("rag_service.llm")
@@ -13,58 +14,64 @@ SYSTEM_PROMPT = """आप राजस्थान सरकार के आध
 2. भाषा एवं शैली:
    - उत्तर का माध्यम और शैली स्रोत दस्तावेज के समान औपचारिक/सरकारी हिंदी (Devanagari script) होनी चाहिए।
    - यदि उपयोगकर्ता का प्रश्न अंग्रेजी में है, तब भी उत्तर को पूरी तरह हिंदी स्रोत पाठ पर ही आधारित रखें, परंतु उत्तर अंग्रेजी में दिया जा सकता है।
-3. यदि प्रश्न का उत्तर दिए गए संदर्भ में उपलब्ध नहीं है, तो स्पष्ट रूप से लिखें कि "प्रदान किए गए संदर्भ में इस संबंध में जानकारी उपलब्ध नहीं है।" (या अंग्रेजी में: "The provided context does not contain this information.")
+3. यदि प्रश्न का उत्तर दिए गए संदर्भ में उपलब्ध नहीं है, तो स्पष्ट रूप से लिखें कि "प्रदान किए गए संदर्भ में इस संबंध में जानकारी उपलब्ध नहीं है।"
 4. सटीकता एवं विवरण:
-   - उत्तर को संक्षिप्त और तथ्यपरक रखें।
-   - विशिष्ट आंकड़ों, तिथियों, समय-सीमाओं (जैसे 48 घंटे, 10000/-, रू0 10000/-) और खंड/पैरा संख्याओं (Clause/Paragraph numbers) को स्रोत दस्तावेज के अनुसार ही सटीक उद्धृत करें।
+   - केवल उपयोगकर्ता के प्रश्न का सीधा, संक्षिप्त और सटीक उत्तर दें।
+   - उत्तर के अंत में कोई अतिरिक्त प्रश्न, अनुवर्ती प्रश्न या वार्तालाप न जोड़ें।
+   - विशिष्ट आंकड़ों, तिथियों, समय-सीमाओं (जैसे 48 घंटे, 10000/-, रू0 10000/-) और खंड/पैरा संख्याओं को स्रोत दस्तावेज के अनुसार ही सटीक उद्धृत करें।
 """
 
 class LLMClient:
     def __init__(self):
-        self.api_key = settings.GROQ_API_KEY
-        self.model = settings.GROQ_MODEL
-        if self.api_key and self.api_key != "your_groq_api_key_here":
+        self.api_key = settings.GROQ_API_KEY.strip()
+        if self.api_key and self.api_key != "gsk_your_key_here":
             self.client = AsyncGroq(api_key=self.api_key)
+            logger.info("Groq AsyncClient initialized successfully.")
         else:
             self.client = None
+            logger.warning("GROQ_API_KEY is missing or unconfigured in .env file.")
 
-    async def generate_answer(self, query: str, context_text: str) -> str:
-        """Generate answer using Groq LLM API with strict grounding in context."""
+    def require_api_key(self):
+        """Re-check API key at call time in case .env was updated dynamically."""
+        current_key = settings.GROQ_API_KEY.strip()
+        if current_key and current_key != "gsk_your_key_here":
+            if not self.client or self.api_key != current_key:
+                self.api_key = current_key
+                self.client = AsyncGroq(api_key=current_key)
+
         if not self.client:
-            raise RuntimeError("GROQ_API_KEY is not configured in .env file.")
+            raise RuntimeError(
+                "GROQ_API_KEY is not configured in .env file. Please add your GROQ_API_KEY to .env to run LLM inference."
+            )
 
-        user_message = f"संदर्भ (Context):\n{context_text}\n\nप्रश्न (Query):\n{query}"
+    async def generate_answer(self, query: str, context: str) -> str:
+        """Synchronous-style full text generation (async call)."""
+        self.require_api_key()
+        user_message = f"संदर्भ (Context):\n{context}\n\nप्रश्न (Query):\n{query}"
 
         try:
             response = await self.client.chat.completions.create(
-                model=self.model,
+                model=settings.GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message}
                 ],
                 temperature=0.0,
-                max_tokens=800,
+                max_tokens=800
             )
-            answer = response.choices[0].message.content.strip()
-            return answer
-        except GroqError as e:
-            logger.error(f"Groq API error: {str(e)}")
-            raise RuntimeError(f"LLM generation failed: {str(e)}")
+            return response.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Unexpected error during LLM generation: {str(e)}")
-            raise RuntimeError(f"LLM generation failed: {str(e)}")
+            logger.error(f"Groq API call failed: {str(e)}")
+            raise RuntimeError(f"Groq API Error: {str(e)}")
 
-    async def generate_answer_stream(self, query: str, context_text: str) -> AsyncGenerator[str, None]:
-        """Stream answer tokens from Groq LLM API safely."""
-        if not self.client:
-            yield "[Error: GROQ_API_KEY is not configured in .env file.]"
-            return
-
-        user_message = f"संदर्भ (Context):\n{context_text}\n\nप्रश्न (Query):\n{query}"
+    async def generate_answer_stream(self, query: str, context: str) -> AsyncGenerator[str, None]:
+        """Real-time token streaming generator over SSE."""
+        self.require_api_key()
+        user_message = f"संदर्भ (Context):\n{context}\n\nप्रश्न (Query):\n{query}"
 
         try:
             stream = await self.client.chat.completions.create(
-                model=self.model,
+                model=settings.GROQ_MODEL,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_message}
@@ -74,9 +81,8 @@ class LLMClient:
                 stream=True
             )
             async for chunk in stream:
-                content = chunk.choices[0].delta.content
-                if content:
-                    yield content
+                if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
         except Exception as e:
-            logger.error(f"Error during LLM streaming: {str(e)}")
+            logger.error(f"Groq SSE Streaming failed: {str(e)}")
             yield f"\n[Error: {str(e)}]"
