@@ -1,0 +1,323 @@
+import json
+
+cells = [
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "# 🏛️ Rajasthan Government Circular RAG Pipeline\n",
+            "### End-to-End Retrieval-Augmented Generation for Devanagari Hindi Government Orders\n",
+            "\n",
+            "This notebook reproduces the complete Multi-User RAG pipeline from `pdf_parser.py`, `vector_store.py`, `llm_client.py`, and `inspect_chunks.py` as sequential notebook cells. It ingests official government circulars (*\"Mukhya Mantri Ayushman Jeevan Raksha Yojana\"*), creates clause-aware vector embeddings, indexes them with local FAISS search, and generates grounded responses in formal Devanagari Hindi using Groq 70B LLM."
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 1: Setup & Environment Configuration\n",
+            "In this section, we load required dependencies (`PyMuPDF`, `sentence-transformers`, `faiss-cpu`, `groq`, `dotenv`) and verify that the `GROQ_API_KEY` is loaded."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "import os\n",
+            "import re\n",
+            "import json\n",
+            "import numpy as np\n",
+            "import fitz  # PyMuPDF\n",
+            "import faiss\n",
+            "from dotenv import load_dotenv\n",
+            "from sentence_transformers import SentenceTransformer\n",
+            "from groq import Groq\n",
+            "\n",
+            "# Load environment variables from .env file\n",
+            "load_dotenv()\n",
+            "\n",
+            "groq_api_key = os.getenv('GROQ_API_KEY', '')\n",
+            "if groq_api_key and groq_api_key != 'your_groq_api_key_here':\n",
+            "    masked_key = groq_api_key[:4] + '...' + groq_api_key[-4:]\n",
+            "    print(f'[OK] GROQ_API_KEY loaded: {masked_key}')\n",
+            "else:\n",
+            "    print('[INFO] GROQ_API_KEY is not configured in .env file')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 2: Clause-Aware PDF Parsing & Annexure Isolation\n",
+            "Government circulars contain structured numbered clauses (`1.`, `2.`, `3.`) and standalone Annexure sections (`ANNEXURE-I`, `ANNEXURE-II`). Our clause parser preserves complete numbered provisions and forces dedicated standalone chunks for Annexures."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "CLAUSE_PATTERN = re.compile(\n",
+            "    r'(?=(\\n|^)(?:'\n",
+            "    r'[0-9]+[\\.\\)]|'\n",
+            "    r'[०-९]+[\\.\\)]|'\n",
+            "    r'\\([0-9]+\\)|'\n",
+            "    r'\\([०-९]+\\)|'\n",
+            "    r'ANNEXURE\\s*[-–—]?\\s*[I|V|X|0-9]+|'\n",
+            "    r'अनेक्सचर\\s*[-–—]?\\s*[I|V|X|0-9|०-९]+|'\n",
+            "    r'प्रकरण\\s*[:\\.]?|'\n",
+            "    r'शर्तें\\s*[:\\.]?|'\n",
+            "    r'पात्रता\\s*[:\\.]?|'\n",
+            "    r'उद्देश्य\\s*[:\\.]?'\n",
+            "    r'))',\n",
+            "    re.IGNORECASE\n",
+            ")\n",
+            "\n",
+            "ANNEXURE_HEADER = re.compile(\n",
+            "    r'^(?:ANNEXURE\\s*[-–—]?\\s*[I|V|X|0-9]+|अनेक्सचर\\s*[-–—]?\\s*[I|V|X|0-9|०-९]+)',\n",
+            "    re.IGNORECASE\n",
+            ")\n",
+            "\n",
+            "def clean_ocr_text(text: str) -> str:\n",
+            "    text = re.sub(r'\\n{3,}', '\\n\\n', text)\n",
+            "    text = re.sub(r'(\\d+)\\s+[\\.]\\s+', r'\\1. ', text)\n",
+            "    text = re.sub(r'([०-९]+)\\s+[\\.]\\s+', r'\\1. ', text)\n",
+            "    return text.strip()\n",
+            "\n",
+            "def parse_pdf_to_chunks(pdf_path: str, max_chunk_chars: int = 500) -> list:\n",
+            "    doc = fitz.open(pdf_path)\n",
+            "    chunks = []\n",
+            "    chunk_counter = 0\n",
+            "\n",
+            "    for page_num in range(len(doc)):\n",
+            "        page_text = clean_ocr_text(doc[page_num].get_text('text'))\n",
+            "        splits = CLAUSE_PATTERN.split(page_text)\n",
+            "        clauses = [s.strip() for s in splits if s and s.strip()]\n",
+            "\n",
+            "        current_chunk = ''\n",
+            "        clause_ref = None\n",
+            "\n",
+            "        for clause in clauses:\n",
+            "            is_annexure = bool(ANNEXURE_HEADER.search(clause))\n",
+            "            match = re.match(r'^([0-9०-९]+[\\.\\)]|\\([0-9०-९]+\\)|ANNEXURE\\s*[-–—]?\\s*[I|V|X|0-9]+|अनेक्सचर\\s*[-–—]?\\s*[I|V|X|0-9]+)', clause, re.I)\n",
+            "            if match:\n",
+            "                clause_ref = match.group(1)\n",
+            "\n",
+            "            if is_annexure:\n",
+            "                if current_chunk.strip():\n",
+            "                    chunks.append({\n",
+            "                        'id': f'chunk_{chunk_counter}',\n",
+            "                        'text': current_chunk.strip(),\n",
+            "                        'page': page_num + 1,\n",
+            "                        'clause': clause_ref or 'general'\n",
+            "                    })\n",
+            "                    chunk_counter += 1\n",
+            "                    current_chunk = ''\n",
+            "                chunks.append({\n",
+            "                    'id': f'chunk_{chunk_counter}',\n",
+            "                    'text': clause.strip(),\n",
+            "                    'page': page_num + 1,\n",
+            "                    'clause': clause_ref or 'annexure'\n",
+            "                })\n",
+            "                chunk_counter += 1\n",
+            "                continue\n",
+            "\n",
+            "            if len(current_chunk) + len(clause) <= max_chunk_chars:\n",
+            "                current_chunk = (current_chunk + '\\n\\n' + clause).strip() if current_chunk else clause\n",
+            "            else:\n",
+            "                if current_chunk.strip():\n",
+            "                    chunks.append({\n",
+            "                        'id': f'chunk_{chunk_counter}',\n",
+            "                        'text': current_chunk.strip(),\n",
+            "                        'page': page_num + 1,\n",
+            "                        'clause': clause_ref or 'general'\n",
+            "                    })\n",
+            "                    chunk_counter += 1\n",
+            "                current_chunk = clause\n",
+            "\n",
+            "        if current_chunk.strip():\n",
+            "            chunks.append({\n",
+            "                'id': f'chunk_{chunk_counter}',\n",
+            "                'text': current_chunk.strip(),\n",
+            "                'page': page_num + 1,\n",
+            "                'clause': clause_ref or 'general'\n",
+            "            })\n",
+            "            chunk_counter += 1\n",
+            "\n",
+            "    return chunks\n",
+            "\n",
+            "# Parse Rajasthan Finance Dept Government Order\n",
+            "pdf_path = './data/rajasthani/Mukhya_Mantri_Ayushman_Jeevan_Raksha_Yojana.pdf'\n",
+            "chunks = parse_pdf_to_chunks(pdf_path)\n",
+            "\n",
+            "print(f'[PDF Parsed]: {pdf_path}')\n",
+            "print(f'[Extracted Chunks]: {len(chunks)}\\n')\n",
+            "print('=' * 75)\n",
+            "for c in chunks:\n",
+            "    snippet = c['text'].replace('\\n', ' ')\n",
+            "    if len(snippet) > 90:\n",
+            "        snippet = snippet[:90] + '...'\n",
+            "    print(f\"[{c['id']}] Page {c['page']} | Clause: {c['clause']} | Length: {len(c['text'])} chars\")\n",
+            "    print(f\"      Snippet: {ascii(snippet)}\")\n",
+            "    print('-' * 75)"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 3: Multilingual Embedding & FAISS Vector Indexing\n",
+            "Each text chunk is converted into a dense vector embedding using `sentence-transformers/paraphrase-multilingual-mpnet-base-v2`. Vectors are L2-normalized and indexed in FAISS (`IndexFlatIP`) for exact Cosine Similarity retrieval."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "embedding_model_name = 'sentence-transformers/paraphrase-multilingual-mpnet-base-v2'\n",
+            "print(f'[INFO] Loading embedding model: {embedding_model_name}...')\n",
+            "embedder = SentenceTransformer(embedding_model_name)\n",
+            "\n",
+            "# Compute embeddings for all chunks\n",
+            "texts = [c['text'] for c in chunks]\n",
+            "embeddings = embedder.encode(texts, convert_to_numpy=True, show_progress_bar=False).astype('float32')\n",
+            "\n",
+            "# L2 Normalize for Cosine Similarity using Inner Product\n",
+            "norms = np.linalg.norm(embeddings, axis=1, keepdims=True)\n",
+            "norms[norms == 0] = 1e-10\n",
+            "normalized_embeddings = embeddings / norms\n",
+            "\n",
+            "# Build FAISS IndexFlatIP index\n",
+            "dimension = embedder.get_sentence_embedding_dimension()\n",
+            "index = faiss.IndexFlatIP(dimension)\n",
+            "index.add(normalized_embeddings)\n",
+            "\n",
+            "# Persist index and metadata locally under ./data/rajasthani/\n",
+            "os.makedirs('./data/rajasthani', exist_ok=True)\n",
+            "index_path = './data/rajasthani/faiss_index.bin'\n",
+            "metadata_path = './data/rajasthani/chunks.json'\n",
+            "\n",
+            "faiss.write_index(index, index_path)\n",
+            "with open(metadata_path, 'w', encoding='utf-8') as f:\n",
+            "    json.dump(chunks, f, ensure_ascii=False, indent=2)\n",
+            "\n",
+            "print('[OK] FAISS Index successfully built and saved!')\n",
+            "print(f'   - Index Path: {index_path}')\n",
+            "print(f'   - Vector Dimension: {dimension}')\n",
+            "print(f'   - Total Stored Vectors: {index.ntotal}')"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 4: Dense Semantic Vector Retrieval\n",
+            "The `retrieve(query, top_k)` function embeds user questions and performs inner-product similarity search against the FAISS index, retrieving top matching context chunks."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "def retrieve(query: str, top_k: int = 3) -> list:\n",
+            "    query_vec = embedder.encode([query], convert_to_numpy=True).astype('float32')\n",
+            "    q_norm = np.linalg.norm(query_vec, axis=1, keepdims=True)\n",
+            "    q_norm[q_norm == 0] = 1e-10\n",
+            "    query_vec = query_vec / q_norm\n",
+            "\n",
+            "    scores, indices = index.search(query_vec, min(top_k, len(chunks)))\n",
+            "\n",
+            "    results = []\n",
+            "    for score, idx in zip(scores[0], indices[0]):\n",
+            "        if idx != -1 and idx < len(chunks):\n",
+            "            item = dict(chunks[idx])\n",
+            "            item['score'] = float(score)\n",
+            "            results.append(item)\n",
+            "    return results\n",
+            "\n",
+            "# Test Retrieval against sample Devanagari queries\n",
+            "test_queries = [\n",
+            "    'सड़क दुर्घटना में घायल व्यक्ति को कितनी राशि दी जाती है?',\n",
+            "    'अस्पताल द्वारा पोर्टल पर प्रविष्टि कितने समय में दर्ज करनी होती है?',\n",
+            "    'ANNEXURE-I के अंतर्गत अस्पताल के लिए क्या दिशा-निर्देश हैं?'\n",
+            "]\n",
+            "\n",
+            "for q in test_queries:\n",
+            "    retrieved = retrieve(q, top_k=2)\n",
+            "    print(f'[Query]: {ascii(q)}')\n",
+            "    for r in retrieved:\n",
+            "        print(f\"   [Score: {r['score']:.4f}] Chunk: {r['id']} | Clause: {r['clause']}\")\n",
+            "    print('-' * 75)"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 5: Factual LLM Answer Generation (Groq 70B)\n",
+            "We pass retrieved context chunks to Groq's 70B model (`llama-3.3-70b-versatile`). The system prompt enforces **strict factual grounding** in formal Devanagari Hindi register, prohibiting outside knowledge and preserving exact figures (`रू0 10000/-`, `48 घंटे`)."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "SYSTEM_PROMPT = \"\"\"आप राजस्थान सरकार के आधिकारिक नियम/परिपत्र (जैसे \"मुख्यमंत्री आयुष्मान जीवन रक्षा योजना\") पर आधारित एक सटीक, तथ्यपरक सहायक हैं।\n\nआपको नीचे केवल संबंधित संदर्भ (Context) दिया जा रहा है। उत्तर देते समय निम्न नियमों का सख्ती से पालन करें:\n\n1. केवल प्रदान किए गए संदर्भ (Context) के आधार पर ही उत्तर दें। कोई बाहरी ज्ञान या अनुमान न लगाएं।\n2. भाषा एवं शैली:\n   - उत्तर का माध्यम और शैली स्रोत दस्तावेज के समान औपचारिक/सरकारी हिंदी (Devanagari script) होनी चाहिए।\n   - यदि उपयोगकर्ता का प्रश्न अंग्रेजी में है, तब भी उत्तर को पूरी तरह हिंदी स्रोत पाठ पर ही आधारित रखें, परंतु उत्तर अंग्रेजी में दिया जा सकता है।\n3. यदि प्रश्न का उत्तर दिए गए संदर्भ में उपलब्ध नहीं है, तो स्पष्ट रूप से लिखें कि \"प्रदान किए गए संदर्भ में इस संबंध में जानकारी उपलब्ध नहीं है।\"\n4. सटीकता एवं विवरण:\n   - उत्तर को संक्षिप्त और तथ्यपरक रखें।\n   - विशिष्ट आंकड़ों, तिथियों, समय-सीमाओं (जैसे 48 घंटे, 10000/-, रू0 10000/-) और खंड/पैरा संख्याओं (Clause/Paragraph numbers) को स्रोत दस्तावेज के अनुसार ही सटीक उद्धृत करें।\n\"\"\"\n\nllm_client = Groq(api_key=groq_api_key) if groq_api_key and groq_api_key != 'your_groq_api_key_here' else None\n\ndef generate_answer(query: str, context_text: str) -> str:\n    if not llm_client:\n        return '[Error: GROQ_API_KEY is not configured in .env file]'\n    \n    user_msg = f'संदर्भ (Context):\\n{context_text}\\n\\nप्रश्न (Query):\\n{query}'\n    \n    response = llm_client.chat.completions.create(\n        model='llama-3.3-70b-versatile',\n        messages=[\n            {'role': 'system', 'content': SYSTEM_PROMPT},\n            {'role': 'user', 'content': user_msg}\n        ],\n        temperature=0.0,\n        max_tokens=800\n    )\n    return response.choices[0].message.content.strip()\n\ndef rag_query(query_text: str, top_k: int = 3) -> dict:\n    retrieved_chunks = retrieve(query_text, top_k=top_k)\n    context_text = '\\n\\n'.join([c['text'] for c in retrieved_chunks])\n    answer = generate_answer(query_text, context_text)\n    return {\n        'query': query_text,\n        'answer': answer,\n        'context': context_text\n    }"
+        ]
+    },
+    {
+        "cell_type": "markdown",
+        "metadata": {},
+        "source": [
+            "## Section 6: Interactive End-to-End Demonstration\n",
+            "Run full RAG pipeline execution on a natural language query about the government order and inspect the retrieved context and generated answer side by side."
+        ]
+    },
+    {
+        "cell_type": "code",
+        "execution_count": None,
+        "metadata": {},
+        "outputs": [],
+        "source": [
+            "# Demo Query\n",
+            "demo_query = 'सड़क दुर्घटना में घायल व्यक्ति को अस्पताल पहुँचाने पर कितनी प्रोत्साहन राशि दी जाती है?'\n",
+            "\n",
+            "result = rag_query(demo_query, top_k=3)\n",
+            "\n",
+            "print('=' * 80)\n",
+            "print(f\"QUERY: {ascii(result['query'])}\")\n",
+            "print('=' * 80)\n",
+            "print('\\nGENERATED GROUNDED ANSWER (Formal Devanagari Hindi):')\n",
+            "print(ascii(result['answer']))\n",
+            "print('\\n' + '-' * 80)\n",
+            "print('RETRIEVED CONTEXT (Raw Chunks Used for Auditing):')\n",
+            "print(ascii(result['context']))\n",
+            "print('=' * 80)"
+        ]
+    }
+]
+
+notebook_json = {
+    "cells": cells,
+    "metadata": {
+        "language_info": {
+            "name": "python"
+        }
+    },
+    "nbformat": 4,
+    "nbformat_minor": 2
+}
+
+with open("rag_pipeline.ipynb", "w", encoding="utf-8") as f:
+    json.dump(notebook_json, f, ensure_ascii=False, indent=1)
+
+print("Successfully updated rag_pipeline.ipynb!")

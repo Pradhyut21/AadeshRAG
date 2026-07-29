@@ -1,0 +1,33 @@
+# Environment & Secrets
+.env
+.env.local
+
+# Virtual Environment
+venv/
+.venv/
+env/
+
+# Python Cache & Bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local Vector Indices & Data Storage (keep directory structure via .gitkeep)
+data/*/faiss_index.bin
+data/*/chunks.json
+data/**/*.bin
+data/**/*.json
+!data/.gitkeep
+
+# Temporary PDF test artifacts
+test.pdf
+test_dev.pdf
+NotoSansDevanagari.ttf
+
+# Jupyter Notebook Checkpoints & Logs
+.ipynb_checkpoints/
+*.log
